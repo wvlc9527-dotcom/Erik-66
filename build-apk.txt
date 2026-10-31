@@ -1,0 +1,537 @@
+name: Compilar APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Crear proyecto Android
+        run: |
+          HTML=$(ls *.html 2>/dev/null | head -1)
+          if [ -z "$HTML" ]; then echo "Falta el archivo .html en la raiz del repositorio"; exit 1; fi
+          mkdir -p android
+          cd android
+          cat > settings.gradle.kts <<'TLEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TrackLife"
+          include(":app")
+          TLEOF
+          cat > build.gradle.kts <<'TLEOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          TLEOF
+          cat > gradle.properties <<'TLEOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          TLEOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'TLEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.tracklife.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.tracklife.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "2.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.webkit:webkit:1.12.1")
+          }
+          TLEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.TrackLife">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          TLEOF
+          mkdir -p app/src/main/java/com/tracklife/app
+          cat > app/src/main/java/com/tracklife/app/MainActivity.kt <<'TLEOF'
+          package com.tracklife.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.util.Base64
+          import android.webkit.JavascriptInterface
+          import android.webkit.ValueCallback
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Toast
+          import androidx.activity.OnBackPressedCallback
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.content.ContextCompat
+          import androidx.webkit.WebViewAssetLoader
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var webView: WebView
+
+              private var fileCallback: ValueCallback<Array<Uri>>? = null
+              private var pendingBytes: ByteArray? = null
+
+              private val appHost = "appassets.androidplatform.net"
+              private val appUrl = "https://$appHost/assets/tracklife.html"
+              private val channelId = "tracklife_reminders"
+
+              // Selector de archivos (foto de perfil, importar copia de seguridad)
+              private val fileLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { res ->
+                  val uris = WebChromeClient.FileChooserParams.parseResult(res.resultCode, res.data)
+                  fileCallback?.onReceiveValue(uris)
+                  fileCallback = null
+              }
+
+              // Guardar archivos (exportar copia de seguridad)
+              private val createDocLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { res ->
+                  val uri = res.data?.data
+                  val bytes = pendingBytes
+                  pendingBytes = null
+                  if (res.resultCode == RESULT_OK && uri != null && bytes != null) {
+                      try {
+                          contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                          Toast.makeText(this, "Archivo guardado", Toast.LENGTH_SHORT).show()
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "No se pudo guardar el archivo", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+
+              // Permiso de notificaciones (Android 13+)
+              private val notifPermLauncher = registerForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  notifyPermissionToPage(if (granted) "granted" else "denied")
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  webView = WebView(this)
+                  setContentView(webView)
+
+                  val assetLoader = WebViewAssetLoader.Builder()
+                      .setDomain(appHost)
+                      .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+                      .build()
+
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      allowFileAccess = false
+                      allowContentAccess = false
+                      textZoom = 100
+                      mediaPlaybackRequiresUserGesture = true
+                      cacheMode = WebSettings.LOAD_DEFAULT
+                  }
+
+                  webView.addJavascriptInterface(Bridge(), "AndroidBridge")
+
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(
+                          view: WebView,
+                          request: WebResourceRequest
+                      ): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+
+                      override fun shouldOverrideUrlLoading(
+                          view: WebView,
+                          request: WebResourceRequest
+                      ): Boolean {
+                          val uri = request.url
+                          if (uri.host == appHost) return false
+                          try {
+                              startActivity(Intent(Intent.ACTION_VIEW, uri))
+                          } catch (_: Exception) {
+                          }
+                          return true
+                      }
+
+                      override fun onPageFinished(view: WebView, url: String?) {
+                          if (url != null && Uri.parse(url).host == appHost) injectBridgeScript()
+                      }
+                  }
+
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onShowFileChooser(
+                          webView: WebView,
+                          filePathCallback: ValueCallback<Array<Uri>>,
+                          params: FileChooserParams
+                      ): Boolean {
+                          fileCallback?.onReceiveValue(null)
+                          fileCallback = filePathCallback
+                          return try {
+                              fileLauncher.launch(params.createIntent())
+                              true
+                          } catch (e: Exception) {
+                              fileCallback = null
+                              false
+                          }
+                      }
+                  }
+
+                  // Botón atrás: primero cierra ventanas abiertas, luego manda la app a segundo plano
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() {
+                          val js = "(function(){var m=document.querySelector('.modal-overlay.open');" +
+                              "if(m){m.classList.remove('open');return true;}return false;})()"
+                          webView.evaluateJavascript(js) { result ->
+                              if (result != "true") moveTaskToBack(true)
+                          }
+                      }
+                  })
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState)
+                  } else {
+                      webView.loadUrl(appUrl)
+                  }
+              }
+
+              override fun onSaveInstanceState(outState: Bundle) {
+                  super.onSaveInstanceState(outState)
+                  webView.saveState(outState)
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+
+              private fun injectBridgeScript() {
+                  try {
+                      val js = assets.open("tracklife_bridge.js").bufferedReader().use { it.readText() }
+                      webView.evaluateJavascript(js, null)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun notifyPermissionToPage(state: String) {
+                  runOnUiThread {
+                      webView.evaluateJavascript(
+                          "window.__tlPermCb && window.__tlPermCb('$state')", null
+                      )
+                  }
+              }
+
+              private fun ensureChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      if (nm.getNotificationChannel(channelId) == null) {
+                          nm.createNotificationChannel(
+                              NotificationChannel(
+                                  channelId, "Recordatorios de tareas",
+                                  NotificationManager.IMPORTANCE_DEFAULT
+                              )
+                          )
+                      }
+                  }
+              }
+
+              /** Funciones que la página puede llamar desde JavaScript. */
+              inner class Bridge {
+
+                  @JavascriptInterface
+                  fun hasNotificationPermission(): Boolean =
+                      NotificationManagerCompat.from(this@MainActivity).areNotificationsEnabled()
+
+                  @JavascriptInterface
+                  fun requestNotificationPermission() {
+                      runOnUiThread {
+                          if (Build.VERSION.SDK_INT >= 33 &&
+                              ContextCompat.checkSelfPermission(
+                                  this@MainActivity, Manifest.permission.POST_NOTIFICATIONS
+                              ) != PackageManager.PERMISSION_GRANTED
+                          ) {
+                              notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                          } else {
+                              notifyPermissionToPage(
+                                  if (hasNotificationPermission()) "granted" else "denied"
+                              )
+                          }
+                      }
+                  }
+
+                  @JavascriptInterface
+                  fun notify(title: String, body: String) {
+                      if (!hasNotificationPermission()) return
+                      ensureChannel()
+                      val launch = packageManager.getLaunchIntentForPackage(packageName)
+                      val pi = PendingIntent.getActivity(
+                          this@MainActivity, 0, launch,
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      )
+                      val n = NotificationCompat.Builder(this@MainActivity, channelId)
+                          .setSmallIcon(R.drawable.ic_stat_notify)
+                          .setContentTitle(title)
+                          .setContentText(body)
+                          .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                          .setAutoCancel(true)
+                          .setContentIntent(pi)
+                          .build()
+                      try {
+                          NotificationManagerCompat.from(this@MainActivity).notify(1001, n)
+                      } catch (_: SecurityException) {
+                      }
+                  }
+
+                  @JavascriptInterface
+                  fun saveFile(name: String, mime: String, base64: String) {
+                      val bytes = try {
+                          Base64.decode(base64, Base64.DEFAULT)
+                      } catch (e: Exception) {
+                          return
+                      }
+                      runOnUiThread {
+                          pendingBytes = bytes
+                          val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                              addCategory(Intent.CATEGORY_OPENABLE)
+                              type = if (mime.isBlank()) "application/octet-stream" else mime
+                              putExtra(Intent.EXTRA_TITLE, name)
+                          }
+                          try {
+                              createDocLauncher.launch(intent)
+                          } catch (e: Exception) {
+                              pendingBytes = null
+                              Toast.makeText(this@MainActivity, "No se pudo guardar el archivo", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+              }
+          }
+          TLEOF
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/tracklife_bridge.js <<'TLEOF'
+          // Puente entre la página web y Android (se inyecta al cargar la página).
+          (function () {
+            if (window.__tlBridgeInjected || !window.AndroidBridge) return;
+            window.__tlBridgeInjected = true;
+            var B = window.AndroidBridge;
+
+            // 1) Notificaciones del sistema: WebView no trae la API Notification, así que se simula.
+            function TLNotification(title, opts) {
+              opts = opts || {};
+              B.notify(String(title), String(opts.body || ''));
+            }
+            TLNotification.permission = B.hasNotificationPermission() ? 'granted' : 'default';
+            TLNotification.requestPermission = function () {
+              return new Promise(function (resolve) {
+                window.__tlPermCb = function (p) {
+                  TLNotification.permission = p;
+                  resolve(p);
+                };
+                B.requestNotificationPermission();
+              });
+            };
+            window.Notification = TLNotification;
+
+            // 2) Descargas (exportar copia de seguridad): los enlaces blob: se guardan con el selector de Android.
+            var origClick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+              var a = this;
+              if (a.download && a.href && a.href.indexOf('blob:') === 0) {
+                fetch(a.href)
+                  .then(function (r) { return r.blob(); })
+                  .then(function (blob) {
+                    var fr = new FileReader();
+                    fr.onload = function () {
+                      var s = String(fr.result);
+                      B.saveFile(a.download, blob.type || 'application/octet-stream', s.substring(s.indexOf(',') + 1));
+                    };
+                    fr.readAsDataURL(blob);
+                  });
+                return;
+              }
+              return origClick.call(a);
+            };
+          })();
+          TLEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">TrackLife</string>
+          </resources>
+          TLEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="primary">#3390EC</color>
+              <color name="primary_dark">#247BC7</color>
+              <color name="icon_background">#3390EC</color>
+          </resources>
+          TLEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.TrackLife" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="colorPrimary">@color/primary</item>
+                  <item name="colorPrimaryDark">@color/primary_dark</item>
+                  <item name="android:statusBarColor">@color/primary</item>
+                  <item name="android:navigationBarColor">@android:color/white</item>
+                  <item name="android:windowBackground">@android:color/white</item>
+              </style>
+          </resources>
+          TLEOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <!-- Círculo suave -->
+              <path
+                  android:fillColor="#33FFFFFF"
+                  android:pathData="M54,54m-26,0a26,26 0,1 1,52 0a26,26 0,1 1,-52 0" />
+              <!-- Palomita -->
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="5"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M41,55 L50,64 L68,44" />
+          </vector>
+          TLEOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_stat_notify.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2.5"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M5,12.5 L10,17.5 L19,7" />
+          </vector>
+          TLEOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          TLEOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'TLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          TLEOF
+          mkdir -p app/src/main/assets
+          cp "../$HTML" app/src/main/assets/tracklife.html
+
+      - name: Compilar APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackLife-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
